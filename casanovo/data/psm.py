@@ -35,6 +35,9 @@ class PepSpecMatch:
         sequence, where len(aa_scores) == len(sequence).
     protein : str
         Protein associated with the peptide sequence (for db mode).
+    aa_mask : Optional[Iterable[bool]]
+        Boolean mask per amino acid position (True for target-derived,
+        False for decoy-derived amino acids).
     """
 
     sequence: str
@@ -53,6 +56,8 @@ class PepSpecMatch:
     _cache_proteoform: Optional[spectrum_utils.proforma.Proteoform] = (
         dataclasses.field(init=False, default=None, repr=False, compare=False)
     )
+    
+    aa_mask: Optional[Iterable[bool]] = dataclasses.field(default_factory=list)
 
     @staticmethod
     def _get_mod_string(
@@ -138,3 +143,4 @@ class PepSpecMatch:
         ]
 
         return "; ".join(mod_strings)
+    
