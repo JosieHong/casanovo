@@ -555,3 +555,56 @@ def test_initialize_tokenizer(caplog):
         "Configured residue(s) not in model alphabet: foo" in msg
         for msg in caplog.messages
     )
+
+
+@pytest.mark.parametrize(
+    "checkpoint_attrs, config_attrs, expected_substring",
+    [
+        # residues differ: warning about residues/masses
+        (
+            {"residues": {"A": 42.0, "B": 43.0}, "index": {"A": 0, "B": 1}},
+            {"residues": {"A": 42.0, "C": 43.0}, "index": {"A": 0, "B": 1}},
+            "residues and/or residue masses",
+        ),
+        # Residue masses differ: warning about residues/masses
+        (
+            {"residues": {"A": 42.0, "B": 43.0}, "index": {"A": 0, "B": 1}},
+            {"residues": {"A": 42.0, "B": 42.0}, "index": {"A": 0, "B": 1}},
+            "residues and/or residue masses",
+        ),
+        # residues same but index differs: warning about indices
+        (
+            {"residues": {"A": 42.0, "B": 43.0}, "index": {"A": 0, "B": 1}},
+            {"residues": {"A": 42.0, "B": 43.0}, "index": {"A": 1, "B": 0}},
+            "residue indices",
+        ),
+        # identical: no warning
+        (
+            {"residues": {"A": 42.0, "B": 43.0}, "index": {"A": 0, "B": 1}},
+            {"residues": {"A": 42.0, "B": 43.0}, "index": {"A": 0, "B": 1}},
+            None,
+        ),
+    ],
+)
+def test_verify_tokenizer(
+    checkpoint_attrs, config_attrs, expected_substring, caplog
+):
+    """Test ModelRunner._verify_tokenizer for warning and non-warning behavior."""
+    checkpoint = unittest.mock.MagicMock(**checkpoint_attrs)
+    config = unittest.mock.MagicMock(**config_attrs)
+
+    with caplog.at_level("WARNING"):
+        ModelRunner._verify_tokenizer(checkpoint, config)
+
+    if expected_substring:
+        # Check that exactly one warning was logged
+        warnings_logged = [
+            rec for rec in caplog.records if rec.levelname == "WARNING"
+        ]
+        assert len(warnings_logged) == 1
+        msg = warnings_logged[0].getMessage()
+        assert expected_substring in msg
+        assert "model checkpoint tokenizer vs config file tokenizer;" in msg
+    else:
+        # Ensure no warnings were logged
+        assert not any(rec.levelname == "WARNING" for rec in caplog.records)
