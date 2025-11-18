@@ -175,12 +175,12 @@ class ModelRunner:
                     )
 
             raise ValueError(
-                "Target and decoy configurations must be identical except for 'residues'. "
+                "The target and decoy configurations for spectra preprocessing and model architecture must be identical."
                 f"Found differences in:\n" + "\n".join(diffs)
             )
 
         logger.info(
-            "Target and decoy configuration consistency check passed (only 'residues' may differ)"
+            "Target and decoy configuration consistency check passed"
         )
 
     def db_search(
