@@ -139,12 +139,29 @@ class ModelRunner:
     def _validate_config_consistency(
         self, target_config: Config, decoy_config: Config
     ) -> None:
-        """Validate that target and decoy configurations are identical except for 'residues'"""
+        """Validate that target and decoy configurations for spectra preprocessing 
+        and model architecture are identical"""
+        checked_items = [
+            'min_peaks',
+            'max_peaks',
+            'min_mz',
+            'max_mz',
+            'min_intensity',
+            'remove_precursor_tol',
+            'max_charge',
+            'dim_model',
+            'n_head',
+            'dim_feedforward',
+            'n_layers',
+            'dropout',
+            'dim_intensity'
+        ]
+
         target_filtered = {
-            k: v for k, v in target_config.items() if k != "residues"
+            k: v for k, v in target_config.items() if k in checked_items
         }
         decoy_filtered = {
-            k: v for k, v in decoy_config.items() if k != "residues"
+            k: v for k, v in decoy_config.items() if k in checked_items
         }
 
         if target_filtered != decoy_filtered:
