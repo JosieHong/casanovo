@@ -139,22 +139,22 @@ class ModelRunner:
     def _validate_config_consistency(
         self, target_config: Config, decoy_config: Config
     ) -> None:
-        """Validate that target and decoy configurations for spectra preprocessing 
+        """Validate that target and decoy configurations for spectra preprocessing
         and model architecture are identical"""
         checked_items = [
-            'min_peaks',
-            'max_peaks',
-            'min_mz',
-            'max_mz',
-            'min_intensity',
-            'remove_precursor_tol',
-            'max_charge',
-            'dim_model',
-            'n_head',
-            'dim_feedforward',
-            'n_layers',
-            'dropout',
-            'dim_intensity'
+            "min_peaks",
+            "max_peaks",
+            "min_mz",
+            "max_mz",
+            "min_intensity",
+            "remove_precursor_tol",
+            "max_charge",
+            "dim_model",
+            "n_head",
+            "dim_feedforward",
+            "n_layers",
+            "dropout",
+            "dim_intensity",
         ]
 
         target_filtered = {
@@ -179,9 +179,7 @@ class ModelRunner:
                 f"Found differences in:\n" + "\n".join(diffs)
             )
 
-        logger.info(
-            "Target and decoy configuration consistency check passed"
-        )
+        logger.info("Target and decoy configuration consistency check passed")
 
     def db_search(
         self,
@@ -271,6 +269,7 @@ class ModelRunner:
             self.model,
             self.loaders.train_dataloader(),
             self.loaders.val_dataloader(),
+            ckpt_path=self.model_filename,  # Training with hyperparameters from checkpoint
         )
 
     def log_metrics(self, test_dataloader: DataLoader) -> None:
@@ -649,8 +648,11 @@ class ModelRunner:
         device = torch.empty(1).device  # Use the default device.
         model_clss = DbSpec2Pep if db_search else Spec2Pep
         try:
+            # Load training parameters from checkpoint rather than
+            # configuration.
             model = model_clss.load_from_checkpoint(
-                model_filename, map_location=device, **loaded_model_params
+                model_filename,
+                map_location=device,  # **loaded_model_params
             )
             # Use tokenizer initialized from config file instead of loaded
             # from checkpoint file.
@@ -670,10 +672,12 @@ class ModelRunner:
             # This only doesn't work if the weights are from an older
             # version.
             try:
+                # Load training parameters from checkpoint rather than
+                # configuration.
                 model = model_clss.load_from_checkpoint(
                     model_filename,
                     map_location=device,
-                    **model_params,
+                    # **model_params,
                 )
                 model.tokenizer = tokenizer
             except RuntimeError:
