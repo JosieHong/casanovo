@@ -77,10 +77,6 @@ class ModelRunner:
         self.output_rootname = output_rootname
         self.overwrite_ckpt_check = overwrite_ckpt_check
 
-        # Validate config consistency if decoy config is provided
-        if config_decoy is not None:
-            self._validate_config_consistency(config, config_decoy)
-
         # Initialized later.
         self.tmp_dir = None
         self.trainer = None
@@ -135,53 +131,6 @@ class ModelRunner:
         self.tmp_dir = None
         if self.writer is not None:
             self.writer.save()
-
-    def _validate_config_consistency(
-        self, target_config: Config, decoy_config: Config
-    ) -> None:
-        """Validate that target and decoy configurations for spectra preprocessing 
-        and model architecture are identical"""
-        checked_items = [
-            'min_peaks',
-            'max_peaks',
-            'min_mz',
-            'max_mz',
-            'min_intensity',
-            'remove_precursor_tol',
-            'max_charge',
-            'dim_model',
-            'n_head',
-            'dim_feedforward',
-            'n_layers',
-            'dropout',
-            'dim_intensity'
-        ]
-
-        target_filtered = {
-            k: v for k, v in target_config.items() if k in checked_items
-        }
-        decoy_filtered = {
-            k: v for k, v in decoy_config.items() if k in checked_items
-        }
-
-        if target_filtered != decoy_filtered:
-            # Find the specific differences for error message
-            diffs = []
-            all_keys = set(target_filtered.keys()) | set(decoy_filtered.keys())
-            for key in all_keys:
-                if target_filtered.get(key) != decoy_filtered.get(key):
-                    diffs.append(
-                        f"  {key}: target={target_filtered.get(key)}, decoy={decoy_filtered.get(key)}"
-                    )
-
-            raise ValueError(
-                "The target and decoy configurations for spectra preprocessing and model architecture must be identical."
-                f"Found differences in:\n" + "\n".join(diffs)
-            )
-
-        logger.info(
-            "Target and decoy configuration consistency check passed"
-        )
 
     def db_search(
         self,
