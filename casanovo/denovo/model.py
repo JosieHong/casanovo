@@ -2260,8 +2260,6 @@ def _perturb_spectrum(
     spectrum = torch.stack([mzs, ints], dim=1)
     perturbed_spectrum = spectrum.clone()
     non_zero_idx = perturbed_spectrum[0, :, 0] > 0
-
-    # Annotate the spectrum based on the correct fragments.
     spectrum = sus.MsmsSpectrum(
         "spectrum",
         precursor_mz,
@@ -2269,19 +2267,39 @@ def _perturb_spectrum(
         spectrum[0, non_zero_idx, 0].cpu().detach().numpy(),
         spectrum[0, non_zero_idx, 1].cpu().detach().numpy(),
     )
-    spectrum = spectrum.annotate_proforma(
-        peptide,
+
+    # Annotate the spectrum based on the correct fragments.
+    # Here, y-ions are annotated directly as we predict from N- to C-terminus.
+    # b-ions are annotated by calculating them from the precursor mass.
+    pred_ion_type = "y"
+    comp_ion_type = "b"
+    spectrum = _annotate_fragment_pairs(
+        spectrum,
+        spf.parse(peptide)[0],
         fragment_tolerance_da,
-        "Da",
-        ion_types="paby",
-        max_ion_charge=precursor_charge,
+        pred_ion_type=pred_ion_type,
+        comp_ion_type=comp_ion_type,
         max_isotope=1,
+        max_ion_charge=precursor_charge,
         neutral_losses=True,
     )
 
+    # Calculate perturbed precursor mass.
+    perturbed_precursor_mass = (precursor_mz - 1.007276) * precursor_charge
+    for aa, ptb_mass in perturbed_aa_masses.items():
+        org_mass = sfa.AA_MASS[aa]
+        perturbed_precursor_mass += ptb_mass - org_mass
+
     # Generate theoretical ions using perturbed masses.
-    perturbed_annotations = _get_perturbed_fragments(
-        spf.parse(peptide)[0], perturbed_aa_masses, precursor_charge
+    perturbed_annotations = _generate_fragment_pairs(
+        fragment=spf.parse(peptide)[0],
+        precursor_mass=perturbed_precursor_mass,
+        pred_ion_type=pred_ion_type,
+        comp_ion_type=comp_ion_type,
+        max_isotope=1,
+        max_charge=precursor_charge,
+        neutral_losses=True,
+        aa_masses=perturbed_aa_masses,
     )
 
     # Change the m/z of annotated peaks to the perturbed m/z.
@@ -2290,6 +2308,10 @@ def _perturb_spectrum(
         if annot.ion_type != "?":
             matches = []
             for perturbed_annot, perturbed_mz in perturbed_annotations:
+                perturbed_annot._mz_delta = (
+                    annot._mz_delta
+                )  # ignore delta for matching
+                # annot._mz_delta = perturbed_annot._mz_delta # ignore delta for matching
                 if perturbed_annot.ion_type == annot.ion_type:
                     matches.append(
                         (
@@ -2319,34 +2341,209 @@ def _perturb_spectrum(
     return perturbed_spectrum[:, 0], perturbed_spectrum[:, 1]
 
 
-def _get_perturbed_fragments(
-    peptide: spf.Proteoform, perturbed_aa_masses: Dict[str, float], charge: int
-) -> List[Tuple[sfa.FragmentAnnotation, float]]:
+def _annotate_fragment_pairs(
+    spectrum: sus.MsmsSpectrum,
+    fragment: spf.Proteoform,
+    fragment_tolerance_da: float,
+    pred_ion_type: str,
+    comp_ion_type: str,
+    max_ion_charge: int,
+    max_isotope: int,
+    neutral_losses: bool,
+) -> sus.MsmsSpectrum:
     """
-    Get the theoretical fragments for a peptide with perturbed amino
-    acid masses.
+    Annotate spectrum peaks with b-ion and y-ion fragment assignments.
+
+    This function generates theoretical fragment ions for a given proteoform and matches
+    them to observed peaks in the spectrum. Both predicted ion types (e.g., y-ions) and
+    their complementary ion types (e.g., b-ions) are calculated and annotated.
 
     Parameters
     ----------
-    peptide : spf.Proteoform
-        The peptide for which to get the theoretical fragments.
-    perturbed_aa_masses : Dict[str, float]
-        The perturbed amino acid masses.
-    charge : int
-        Fragment charges to consider.
+    spectrum : sus.MsmsSpectrum
+        The MS/MS spectrum to annotate with fragment ion assignments.
+    fragment : spf.Proteoform
+        The proteoform (peptide sequence with modifications) to generate theoretical
+        fragments from.
+    fragment_tolerance_da : float
+        The fragment tolerance in Da for matching theoretical peaks to observed peaks.
+    pred_ion_type : str
+        The predicted ion type to generate (e.g., 'y' for y-ions).
+    comp_ion_type : str
+        The complementary ion type to generate (e.g., 'b' for b-ions when pred_ion_type
+        is 'y').
+    max_ion_charge : int
+        The maximum charge state to consider for fragment ions.
+    max_isotope : int
+        The maximum isotope number to consider for fragment ions.
+    neutral_losses : bool
+        Whether to include neutral loss fragments (e.g., -H2O, -NH3).
+
+    Returns
+    -------
+    sus.MsmsSpectrum
+        The input spectrum with added fragment ion annotations in the _annotation
+        attribute.
+    """
+    # Calculate precursor mass from spectrum.
+    precursor_mass = (
+        spectrum.precursor_mz - 1.007276
+    ) * spectrum.precursor_charge
+
+    # Generate theoretical fragment peaks for both b and y ions using standard amino acid masses.
+    fragment_peaks = _generate_fragment_pairs(
+        fragment=fragment,
+        precursor_mass=precursor_mass,
+        pred_ion_type=pred_ion_type,
+        comp_ion_type=comp_ion_type,
+        max_isotope=max_isotope,
+        max_charge=max_ion_charge,
+        neutral_losses=neutral_losses,
+    )
+
+    # Match spectrum peaks to fragment peaks.
+    annotated_peaks = {}  # {spectrum_mz: annotation_str}
+    best_deltas = [float("inf")] * len(
+        spectrum.mz
+    )  # Track best delta for each peak
+    annotation_array = [None] * len(spectrum.mz)
+
+    for frag_annotation, target_mz in fragment_peaks:
+        # Find all peaks within tolerance.
+        candidates = []
+        for idx, spec_mz in enumerate(spectrum.mz):
+            delta = abs(spec_mz - target_mz)
+            if delta < fragment_tolerance_da:
+                candidates.append((idx, spec_mz, delta))
+
+        # If candidates found, use the one with smallest delta.
+        if candidates:
+            # Sort by delta and take the best match.
+            best_idx, best_mz, best_delta = min(candidates, key=lambda x: x[2])
+
+            # Annotate if this peak hasn't been annotated yet, or if this is a better match.
+            if best_delta < best_deltas[best_idx]:
+                best_deltas[best_idx] = best_delta
+
+                # Create a new FragmentAnnotation with the mz_delta set
+                best_annotation = sfa.FragmentAnnotation(
+                    ion_type=frag_annotation.ion_type,
+                    neutral_loss=frag_annotation.neutral_loss,
+                    isotope=frag_annotation.isotope,
+                    charge=frag_annotation.charge,
+                    adduct=frag_annotation.adduct,
+                    analyte_number=frag_annotation.analyte_number,
+                    mz_delta=(best_delta, "Da"),  # Store delta in Daltons
+                )
+
+                annotated_peaks[best_mz] = best_annotation.ion_type
+
+                # Create PeakInterpretation with the FragmentAnnotation.
+                peak_interp = sfa.PeakInterpretation()
+                peak_interp.fragment_annotations = [best_annotation]
+                annotation_array[best_idx] = peak_interp
+
+    # Annotate all non-annotated peaks as unknown ('?').
+    for idx in range(len(annotation_array)):
+        if annotation_array[idx] is None:
+            unknown_annotation = sfa.FragmentAnnotation(ion_type="?")
+            peak_interp = sfa.PeakInterpretation()
+            peak_interp.fragment_annotations = [unknown_annotation]
+            annotation_array[idx] = peak_interp
+
+    # Convert to numpy array with object dtype.
+    annotation_array = np.array(annotation_array, dtype=object)
+
+    # Add annotations to the spectrum object.
+    spectrum._annotation = annotation_array
+
+    return spectrum
+
+
+def _generate_fragment_pairs(
+    fragment: spf.Proteoform,
+    precursor_mass: float,
+    pred_ion_type: str,
+    comp_ion_type: str,
+    max_isotope: int,
+    max_charge: int,
+    neutral_losses: bool,
+    aa_masses: Optional[Dict[str, float]] = None,
+) -> List[Tuple[sfa.FragmentAnnotation, float]]:
+    """
+    Generate theoretical fragment ion pairs (predicted and complementary) for a proteoform.
+
+    This function generates both predicted ion types (e.g., y-ions) and their complementary
+    ion types (e.g., b-ions) by calculating the complementary m/z from the precursor mass.
+    Optionally uses custom amino acid masses for generating perturbed fragments (e.g., for
+    demi-decoy spectra).
+
+    Parameters
+    ----------
+    fragment : spf.Proteoform
+        The proteoform (peptide sequence with modifications) to generate theoretical
+        fragments from.
+    precursor_mass : float
+        The precursor mass (neutral mass) of the peptide.
+    pred_ion_type : str
+        The predicted ion type to generate (e.g., 'y' for y-ions).
+    comp_ion_type : str
+        The complementary ion type to generate (e.g., 'b' for b-ions when pred_ion_type
+        is 'y').
+    max_isotope : int
+        The maximum isotope number to consider for fragment ions.
+    max_charge : int
+        The maximum charge state to consider for fragment ions.
+    neutral_losses : bool
+        Whether to include neutral loss fragments (e.g., -H2O, -NH3).
+    aa_masses : Optional[Dict[str, float]], optional
+        Custom amino acid masses to use for fragment calculation. If provided, these
+        temporarily replace the standard amino acid masses. Useful for generating
+        perturbed fragments for demi-decoy spectra.
 
     Returns
     -------
     List[Tuple[sfa.FragmentAnnotation, float]]
-        The theoretical fragments with their m/z values.
+        A list of tuples, each containing a FragmentAnnotation object and its
+        corresponding m/z value. Includes both predicted and complementary ion types.
     """
-    original_aa_masses, sfa.AA_MASS = sfa.AA_MASS, perturbed_aa_masses
-    perturbed_annotations = sfa.get_theoretical_fragments(
-        peptide,
-        ion_types="paby",
-        max_isotope=1,
-        neutral_losses=sfa.NEUTRAL_LOSS,
-        max_charge=max(1, charge),
+    if aa_masses is not None:
+        original_aa_masses, sfa.AA_MASS = sfa.AA_MASS, aa_masses
+
+    # Get partial sequence fragments for predicted ion type.
+    partial_fragments = sfa.get_theoretical_fragments(
+        fragment,
+        ion_types=pred_ion_type,
+        max_isotope=max_isotope,
+        neutral_losses=sfa.NEUTRAL_LOSS if neutral_losses else None,
+        max_charge=max_charge,
     )
-    sfa.AA_MASS = original_aa_masses
-    return perturbed_annotations
+
+    # Calculate target m/z values from partial sequence.
+    frag_peaks = []  # List[Tuple[FragmentAnnotation, float]]
+
+    for frag_annotation, frag_mz in partial_fragments:
+        frag_str = str(frag_annotation)
+
+        # Add predicted amino acid fragment.
+        frag_peaks.append((frag_annotation, frag_mz))
+
+        # Convert frag_mz back to neutral mass, then calculate complement m/z.
+        frag_neutral_mass = (frag_mz - 1.007276) * frag_annotation.charge
+        comp_neutral_mass = precursor_mass - frag_neutral_mass
+        comp_mz = (
+            comp_neutral_mass + 1.007276 * frag_annotation.charge
+        ) / frag_annotation.charge
+
+        # Add complementary fragment.
+        comp_annotation = sfa.FragmentAnnotation(
+            ion_type=f"{comp_ion_type}:{frag_str}",
+            charge=frag_annotation.charge,
+        )
+        frag_peaks.append((comp_annotation, comp_mz))
+
+    # Restore original AA masses.
+    if aa_masses is not None:
+        sfa.AA_MASS = original_aa_masses
+
+    return frag_peaks

@@ -4,8 +4,10 @@ import numpy as np
 import torch
 from unittest.mock import MagicMock, patch
 
-from casanovo.denovo.model import Spec2PepTargetDecoy
+from casanovo.denovo.model import Spec2PepTargetDecoy, _annotate_fragment_pairs
 from casanovo.data import psm
+import spectrum_utils.proforma as spf
+import spectrum_utils.spectrum as sus
 
 
 def make_mock_model(name: str, aa: str, aa_score: list[float]):
@@ -159,3 +161,51 @@ def test_spec2peptargetdecoy_forward(mock_aa_pep, mock_perturb):
     assert pred.spectrum_id == (filename, scan)
     assert pred.charge == 2
     assert pred.exp_mz == 500.0
+
+
+def test_complementary_ions_annotated():
+    """Test that both predicted and complementary ions are annotated."""
+    fragment = spf.parse("PEPTIDE")[0]
+
+    # Use realistic m/z values that match theoretical y and b ions
+    # y1^1 ≈ 149.07, y2^2 ≈ 132.55, b5^2 ≈ 368.15, y4^2 ≈ 239.63
+    spectrum = sus.MsmsSpectrum(
+        identifier="test_spectrum",
+        precursor_mz=500.0,
+        precursor_charge=2,
+        mz=np.array(
+            [149.0, 132.5, 239.6, 264.1, 377.2]
+        ),  # Approximate y-ion matches
+        intensity=np.array([10.0, 20.0, 30.0, 40.0, 50.0]),
+    )
+
+    result = _annotate_fragment_pairs(
+        spectrum=spectrum,
+        fragment=fragment,
+        fragment_tolerance_da=1.0,
+        pred_ion_type="y",
+        comp_ion_type="b",
+        max_ion_charge=2,
+        max_isotope=0,
+        neutral_losses=False,
+    )
+
+    # Collect all ion types
+    ion_types = [
+        annot[0].ion_type
+        for annot in result._annotation
+        if annot[0].ion_type != "?"
+    ]
+
+    # Check that we have y ions annotated
+    has_y = any("y" in ion_type for ion_type in ion_types)
+    # Check that we have b ions (shown as "b:y..." format)
+    has_b = any(ion_type.startswith("b:") for ion_type in ion_types)
+
+    assert len(ion_types) > 0, "At least some peaks should be annotated."
+    assert (
+        has_y
+    ), f"Should have y-ion annotations. Annotated ion types: {ion_types}."
+    assert (
+        has_b
+    ), f"Should have complementary b-ion annotations. Annotated ion types: {ion_types}."
