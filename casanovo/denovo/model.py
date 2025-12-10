@@ -1484,6 +1484,7 @@ class Spec2PepTargetDecoy(pl.LightningModule):
         ).to(self.device)
 
         for spectrum_idx in range(len(mzs)):
+
             mzs_t = mzs[spectrum_idx : spectrum_idx + 1]
             ints_t = ints[spectrum_idx : spectrum_idx + 1]
             precursor = precursors[spectrum_idx : spectrum_idx + 1]
@@ -1508,6 +1509,7 @@ class Spec2PepTargetDecoy(pl.LightningModule):
             # reached.
             # The stop token does not count towards max_length.
             for aa_idx in range(self.model_t.max_peptide_len + 1):
+
                 # Predict the next amino acid using the target and decoy
                 # models from the partially prediction from target model.
                 token = (

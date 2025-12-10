@@ -48,6 +48,7 @@ class PepSpecMatch:
     exp_mz: float
     aa_scores: Iterable[float]
     protein: str = "null"
+    aa_mask: Optional[Iterable[bool]] = dataclasses.field(default_factory=list)
 
     # Private properties to handle proteoform caching
     _proteoform_sequence: Optional[str] = dataclasses.field(
@@ -56,8 +57,6 @@ class PepSpecMatch:
     _cache_proteoform: Optional[spectrum_utils.proforma.Proteoform] = (
         dataclasses.field(init=False, default=None, repr=False, compare=False)
     )
-    
-    aa_mask: Optional[Iterable[bool]] = dataclasses.field(default_factory=list)
 
     @staticmethod
     def _get_mod_string(
@@ -143,4 +142,3 @@ class PepSpecMatch:
         ]
 
         return "; ".join(mod_strings)
-    
