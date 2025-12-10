@@ -1364,6 +1364,9 @@ class Spec2PepTargetDecoy(pl.LightningModule):
 
         self.model_t, self.model_d = model_t, model_d
 
+        # FIXME: check consistency of tokenizer residues
+        self.tokenizer = model_t.tokenizer
+
         self.fragment_tolerance_da = fragment_tolerance_da
 
         # Get perturbed amino acid masses.
@@ -1380,14 +1383,24 @@ class Spec2PepTargetDecoy(pl.LightningModule):
 
         # Get shifted amino acid masses, including modifications.
         self.shifted_aa_masses = {
-            model_t.tokenizer.tokenize(aa).item(): model_d.tokenizer.residues[
-                aa
-            ]
-            - model_t.tokenizer.residues[aa]
-            for aa in model_t.tokenizer.residues.keys()
+            self.tokenizer.tokenize(aa).item(): model_d.tokenizer.residues[aa]
+            - self.tokenizer.residues[aa]
+            for aa in self.tokenizer.residues.keys()
         }
 
         self.out_writer = out_writer
+
+    @property
+    def device(self) -> torch.device:
+        """
+        The device on which the model is currently running.
+
+        Returns
+        -------
+        torch.device
+            The device on which the model is currently running.
+        """
+        return next(self.parameters()).device
 
     def _process_batch(
         self, batch: Dict[str, torch.Tensor]
@@ -1484,7 +1497,6 @@ class Spec2PepTargetDecoy(pl.LightningModule):
         ).to(self.device)
 
         for spectrum_idx in range(len(mzs)):
-
             mzs_t = mzs[spectrum_idx : spectrum_idx + 1]
             ints_t = ints[spectrum_idx : spectrum_idx + 1]
             precursor = precursors[spectrum_idx : spectrum_idx + 1]
@@ -1509,7 +1521,6 @@ class Spec2PepTargetDecoy(pl.LightningModule):
             # reached.
             # The stop token does not count towards max_length.
             for aa_idx in range(self.model_t.max_peptide_len + 1):
-
                 # Predict the next amino acid using the target and decoy
                 # models from the partially prediction from target model.
                 token = (
@@ -1550,9 +1561,6 @@ class Spec2PepTargetDecoy(pl.LightningModule):
                     scores[spectrum_idx, aa_idx, :] = score_d
                     tokens[spectrum_idx, aa_idx] = torch.argmax(score_d)
 
-                # Record the mixed peptide tokens corresponding to scores.
-                pep_mixed_tokens = tokens[spectrum_idx, : aa_idx + 1]
-
                 # Update the predicted peptide sequence.
                 target_tokens[spectrum_idx, aa_idx] = torch.argmax(score_t)
 
@@ -1560,57 +1568,30 @@ class Spec2PepTargetDecoy(pl.LightningModule):
                 pep_target_tokens = target_tokens[spectrum_idx, : aa_idx + 1]
                 # FIXME: Fix this when depthcharge reverse
                 #   detokenization bug is fixed.
-                # peptide = self.model_t.tokenizer.detokenize(
+                # peptide = self.tokenizer.detokenize(
                 #     torch.unsqueeze(pred_tokens, 0)
                 # )[0]
                 peptide = "".join(
-                    self.model_t.tokenizer.detokenize(
+                    self.tokenizer.detokenize(
                         torch.unsqueeze(pep_target_tokens, 0),
                         join=False,
                     )[0]
                 )
 
-                # Terminate the sequence algorithm, if target model predicts the stop token.
-                # Others need to be added later.
+                # Terminate if target model predicts the stop token.
                 if pep_target_tokens[-1] == self.model_t.stop_token:
-                    # Omit the stop token from the peptide sequence (if predicted by target
-                    # model). Also remove the corresponding amino acid score from the mixed
-                    # results to keep the sequence length aligned with the amino acid scores.
-                    has_stop_token = (
-                        pep_target_tokens[-1] == self.model_t.stop_token
-                    )
-                    pep_mixed_tokens = (
-                        pep_mixed_tokens[:-1]
-                        if has_stop_token
-                        else pep_mixed_tokens
-                    )
-
-                    # Calculate the amino acid and peptide scores.
-                    end_aa_idx = aa_idx if has_stop_token else aa_idx + 1
-                    aa_scores = self.model_t.softmax(
-                        scores[spectrum_idx : spectrum_idx + 1, :end_aa_idx, :]
-                    )
-                    aa_scores = aa_scores[
-                        0, range(end_aa_idx), pep_mixed_tokens
-                    ]
-                    aa_scores = aa_scores.tolist()
-                    if self.model_t.tokenizer.reverse:
-                        aa_scores = aa_scores[::-1]
-
-                    # Don't penalize non-fitting precursor m/z.
-                    aa_scores, peptide_score = _aa_pep_score(aa_scores, True)
-
-                    psms.append(
-                        (
-                            peptide_score,
-                            aa_scores,
-                            target_mask[spectrum_idx][:end_aa_idx]
-                            .cpu()
-                            .detach()
-                            .numpy(),
-                            peptide,
+                    peptide_score, aa_scores, aa_mask, peptide = (
+                        self._postprocess_token_and_score(
+                            scores=scores,
+                            tokens=tokens,
+                            target_mask=target_mask,
+                            spectrum_idx=spectrum_idx,
+                            aa_idx=aa_idx,
+                            has_stop_token=True,
+                            peptide=peptide,
                         )
                     )
+                    psms.append((peptide_score, aa_scores, aa_mask, peptide))
                     break
 
                 # Update the demi-decoy spectrum for the next prediction.
@@ -1634,7 +1615,92 @@ class Spec2PepTargetDecoy(pl.LightningModule):
                 if torch.argmax(score_d) == self.model_d.stop_token:
                     stop_d = True
 
+            else:
+                # Add PSM when max length is exceeded without a stop token.
+                peptide_score, aa_scores, aa_mask, peptide = (
+                    self._postprocess_token_and_score(
+                        scores=scores,
+                        tokens=tokens,
+                        target_mask=target_mask,
+                        spectrum_idx=spectrum_idx,
+                        aa_idx=aa_idx,
+                        has_stop_token=False,
+                        peptide=peptide,
+                    )
+                )
+                psms.append((peptide_score, aa_scores, aa_mask, peptide))
+
         return psms
+
+    def _postprocess_token_and_score(
+        self,
+        scores: torch.Tensor,
+        tokens: torch.Tensor,
+        target_mask: torch.Tensor,
+        spectrum_idx: int,
+        aa_idx: int,
+        has_stop_token: bool,
+        peptide: str,
+    ) -> Tuple[float, List[float], np.ndarray, str]:
+        """
+        Postprocess tokens and scores to create a PSM.
+
+        Parameters
+        ----------
+        scores : torch.Tensor
+            Scores tensor for all spectra.
+        tokens : torch.Tensor
+            Mixed tokens (from target or decoy) for all spectra.
+        target_mask : torch.Tensor
+            Mask indicating whether each token came from target model.
+        spectrum_idx : int
+            Index of the current spectrum.
+        aa_idx : int
+            Current amino acid index in the sequence.
+        has_stop_token : bool
+            Whether the sequence ended with a stop token.
+        peptide : str
+            The predicted peptide sequence.
+
+        Returns
+        -------
+        peptide_score : float
+            The overall peptide score.
+        aa_scores : List[float]
+            Amino acid-level scores.
+        aa_mask : np.ndarray
+            Target/decoy mask for each amino acid.
+        peptide : str
+            The predicted peptide sequence.
+        """
+        # Get the mixed tokens for this spectrum.
+        pep_mixed_tokens = tokens[spectrum_idx, : aa_idx + 1]
+
+        # Remove stop token from mixed tokens if present.
+        if has_stop_token:
+            pep_mixed_tokens = pep_mixed_tokens[:-1]
+
+        # Calculate the end index for scoring.
+        end_aa_idx = aa_idx if has_stop_token else aa_idx + 1
+
+        # Calculate amino acid scores using softmax.
+        aa_scores = self.model_t.softmax(
+            scores[spectrum_idx : spectrum_idx + 1, :end_aa_idx, :]
+        )
+        aa_scores = aa_scores[0, range(end_aa_idx), pep_mixed_tokens]
+        aa_scores = aa_scores.tolist()
+
+        # Reverse if needed.
+        if self.tokenizer.reverse:
+            aa_scores = aa_scores[::-1]
+
+        # Get target mask for the amino acids.
+        aa_mask = target_mask[spectrum_idx][:end_aa_idx].cpu().detach().numpy()
+
+        # Calculate peptide score (don't penalize non-fitting precursor m/z).
+        aa_scores, peptide_score = _aa_pep_score(aa_scores, True)
+
+        return peptide_score, aa_scores, aa_mask, peptide
 
     def training_step(self, *args) -> None:
         raise NotImplementedError(
@@ -1723,11 +1789,9 @@ class Spec2PepTargetDecoy(pl.LightningModule):
                 spec_match.aa_scores = spec_match.aa_scores[1:]
 
             # Compute the precursor m/z for reporting
-            spec_match.calc_mz = (
-                self.model_t.tokenizer.calculate_precursor_ions(
-                    spec_match.sequence, torch.tensor(spec_match.charge)
-                ).item()
-            )
+            spec_match.calc_mz = self.tokenizer.calculate_precursor_ions(
+                spec_match.sequence, torch.tensor(spec_match.charge)
+            ).item()
 
             self.out_writer.psms.append(spec_match)
 
@@ -2275,9 +2339,10 @@ def _perturb_spectrum(
     # b-ions are annotated by calculating them from the precursor mass.
     pred_ion_type = "y"
     comp_ion_type = "b"
+    parsed_peptide = spf.parse(peptide)[0]
     spectrum = _annotate_fragment_pairs(
         spectrum,
-        spf.parse(peptide)[0],
+        parsed_peptide,
         fragment_tolerance_da,
         pred_ion_type=pred_ion_type,
         comp_ion_type=comp_ion_type,
@@ -2294,7 +2359,7 @@ def _perturb_spectrum(
 
     # Generate theoretical ions using perturbed masses.
     perturbed_annotations = _generate_fragment_pairs(
-        fragment=spf.parse(peptide)[0],
+        fragment=parsed_peptide,
         precursor_mass=perturbed_precursor_mass,
         pred_ion_type=pred_ion_type,
         comp_ion_type=comp_ion_type,
@@ -2522,7 +2587,7 @@ def _generate_fragment_pairs(
     )
 
     # Calculate target m/z values from partial sequence.
-    frag_peaks = []  # List[Tuple[FragmentAnnotation, float]]
+    frag_peaks = []
 
     for frag_annotation, frag_mz in partial_fragments:
         frag_str = str(frag_annotation)
