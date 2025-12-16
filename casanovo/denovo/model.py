@@ -1364,6 +1364,9 @@ class Spec2PepTargetDecoy(pl.LightningModule):
 
         self.model_t, self.model_d = model_t, model_d
 
+        # FIXME: check consistency of tokenizer residues
+        self.tokenizer = model_t.tokenizer
+
         self.fragment_tolerance_da = fragment_tolerance_da
 
         # Get perturbed amino acid masses.
@@ -1380,14 +1383,40 @@ class Spec2PepTargetDecoy(pl.LightningModule):
 
         # Get shifted amino acid masses, including modifications.
         self.shifted_aa_masses = {
-            model_t.tokenizer.tokenize(aa).item(): model_d.tokenizer.residues[
-                aa
-            ]
-            - model_t.tokenizer.residues[aa]
-            for aa in model_t.tokenizer.residues.keys()
+            self.tokenizer.tokenize(aa).item(): model_d.tokenizer.residues[aa]
+            - self.tokenizer.residues[aa]
+            for aa in self.tokenizer.residues.keys()
         }
 
+        # Get n-term mod tokens
+        self.n_term = [
+            aa
+            for aa in self.tokenizer.index
+            if aa.startswith("[") and aa.endswith("]-")
+        ]
+        # Register tensor buffer for N-terminal modification indices
+        self.register_buffer(
+            "nterm_idx",
+            torch.tensor(
+                [self.tokenizer.index[aa] for aa in self.n_term],
+                dtype=torch.int,
+            ),
+            persistent=False,
+        )
+
         self.out_writer = out_writer
+
+    @property
+    def device(self) -> torch.device:
+        """
+        The device on which the model is currently running.
+
+        Returns
+        -------
+        torch.device
+            The device on which the model is currently running.
+        """
+        return next(self.parameters()).device
 
     def _process_batch(
         self, batch: Dict[str, torch.Tensor]
@@ -1434,7 +1463,7 @@ class Spec2PepTargetDecoy(pl.LightningModule):
         self, batch: Dict[str, torch.Tensor]
     ) -> List[Tuple[float, np.ndarray, np.ndarray, str]]:
         """
-        Target-decoy decoding of the spectrum predictions.
+        Batched target-decoy decoding of the spectrum predictions.
 
         Parameters
         ----------
@@ -1454,187 +1483,261 @@ class Spec2PepTargetDecoy(pl.LightningModule):
             predicted peptide sequence.
         """
         mzs, ints, precursors, _ = self._process_batch(batch)
+        batch_size = mzs.shape[0]
+        max_len = self.model_t.max_peptide_len + 1
+        vocab_size = self.model_t.vocab_size
+        device = self.device
 
-        # Output predicted peptide-spectrum matches.
-        psms = []
+        # Encode all target spectra once (parallel)
+        memories_t, mem_masks_t = self.model_t.encoder(mzs, ints)
 
-        # Mask to indicate whether each predicted amino acid was provided by
-        # the target or decoy model.
-        target_mask = torch.empty(
-            mzs.shape[0],
-            self.model_t.max_peptide_len + 1,
-            dtype=torch.bool,
-        ).to(self.device)
-        # Scores for the best amino acid prediction at each position from
-        # either the target or decoy model.
-        scores = torch.zeros(
-            mzs.shape[0],
-            self.model_t.max_peptide_len + 1,
-            self.model_t.vocab_size,
-        ).to(self.device)
-        # Tokens for the best amino acid prediction at each position from
-        # either the target or decoy model.
+        # Initialize decoy with target spectra
+        mzs_d = mzs.clone()
+        ints_d = ints.clone()
+        memories_d, mem_masks_d = self.model_d.encoder(mzs_d, ints_d)
+
+        # State tensors for all spectra
+        target_mask = torch.zeros(
+            batch_size, max_len, dtype=torch.bool, device=device
+        )
+        scores = torch.zeros(batch_size, max_len, vocab_size, device=device)
         tokens = torch.zeros(
-            mzs.shape[0], self.model_t.max_peptide_len + 1, dtype=torch.int64
-        ).to(self.device)
-        # Tokens predicted by the target model; used in the final output and
-        # every iteration to update inputs.
+            batch_size, max_len, dtype=torch.int64, device=device
+        )
         target_tokens = torch.zeros(
-            mzs.shape[0], self.model_t.max_peptide_len + 1, dtype=torch.int64
-        ).to(self.device)
+            batch_size, max_len, dtype=torch.int64, device=device
+        )
 
-        for spectrum_idx in range(len(mzs)):
+        # Track which spectra are still active
+        active = torch.ones(batch_size, dtype=torch.bool, device=device)
+        stop_d = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        last_aa_idx = torch.zeros(batch_size, dtype=torch.int64, device=device)
 
-            mzs_t = mzs[spectrum_idx : spectrum_idx + 1]
-            ints_t = ints[spectrum_idx : spectrum_idx + 1]
-            precursor = precursors[spectrum_idx : spectrum_idx + 1]
-            accumulated_mass_shift = 0
+        for aa_idx in range(max_len):
+            if not torch.any(active):
+                break
 
-            # Encode the spectrum using the target model.
-            # This encoding remains the same for each prediction and can be
-            # reused.
-            memories_t, mem_masks_t = self.model_t.encoder(mzs_t, ints_t)
-
-            # For the first predicted amino acid, no shifted peaks are
-            # available yet, so the target spectrum is provided to the decoy
-            # model.
-            memories_d, mem_masks_d = self.model_d.encoder(mzs_t, ints_t)
-
-            # Record whether the decoy model has predicted a stop token.
-            # If the target model predicts a stop token, terminate the sequence algorithm.
-            # If the decoy model stops while the target continues, mark the decoy as failed.
-            stop_d = False
-
-            # Keep predicting until a stop token is predicted or max_length is
-            # reached.
-            # The stop token does not count towards max_length.
-            for aa_idx in range(self.model_t.max_peptide_len + 1):
-
-                # Predict the next amino acid using the target and decoy
-                # models from the partially prediction from target model.
-                token = (
-                    target_tokens[spectrum_idx : spectrum_idx + 1, :aa_idx]
-                    if aa_idx > 0
-                    else torch.zeros(
-                        1, 0, dtype=torch.int64, device=self.device
-                    )
+            # Get current tokens for active spectra
+            if aa_idx > 0:
+                current_tokens = target_tokens[active, :aa_idx]
+            else:
+                current_tokens = torch.zeros(
+                    active.sum(), 0, dtype=torch.int64, device=device
                 )
 
-                # Get precursor for decoy model according to (partially) predicted peptide sequence.
-                precursor_d = precursor.clone()
-                precursor_d[:, 0] += accumulated_mass_shift
+            # Target predictions for all active spectra
+            score_t = self.model_t.decoder(
+                tokens=current_tokens,
+                memory=memories_t[active],
+                memory_key_padding_mask=mem_masks_t[active],
+                precursors=precursors[active],
+            )[:, -1:, :]
 
-                score_t = self.model_t.decoder(
-                    tokens=token,
-                    memory=memories_t,
-                    memory_key_padding_mask=mem_masks_t,
-                    precursors=precursor,
-                )[0:1, -1:, :]
-                if not stop_d:
-                    score_d = self.model_d.decoder(
-                        tokens=token,
-                        memory=memories_d,
-                        memory_key_padding_mask=mem_masks_d,
-                        precursors=precursor_d,
-                    )[0:1, -1:, :]
+            # Decoy predictions for active spectra that haven't stopped
+            active_not_stop_d = active & ~stop_d
+            score_d_dict = {}
 
-                # Record whether the highest scored amino acid is a target or
-                # a decoy. If one model stops while the other continues,
-                # record the continuing model.
-                if stop_d or (score_t.max() > score_d.max()):
-                    target_mask[spectrum_idx, aa_idx] = True
-                    scores[spectrum_idx, aa_idx, :] = score_t
-                    tokens[spectrum_idx, aa_idx] = torch.argmax(score_t)
+            if torch.any(active_not_stop_d):
+                score_d_batch = self.model_d.decoder(
+                    tokens=current_tokens[~stop_d[active]], # current tokens are already filtered by active
+                    memory=memories_d[active_not_stop_d],
+                    memory_key_padding_mask=mem_masks_d[active_not_stop_d],
+                    precursors=precursors[active_not_stop_d],
+                )[:, -1:, :]
+
+                # Map scores back to original indices
+                for i, spec_idx in enumerate(torch.where(active_not_stop_d)[0]):
+                    score_d_dict[spec_idx.item()] = score_d_batch[i]
+
+            # Choose best token for each active spectrum
+            active_indices = torch.where(active)[0]
+            for i, spec_idx in enumerate(active_indices):
+                spec_idx_item = spec_idx.item()
+
+                use_target = (
+                    stop_d[spec_idx]
+                    or spec_idx_item not in score_d_dict
+                    or score_t[i].max() > score_d_dict[spec_idx_item].max()
+                )
+
+                if use_target:
+                    target_mask[spec_idx, aa_idx] = True
+                    scores[spec_idx, aa_idx, :] = score_t[i, 0, :]
+                    tokens[spec_idx, aa_idx] = torch.argmax(score_t[i])
                 else:
-                    target_mask[spectrum_idx, aa_idx] = False
-                    scores[spectrum_idx, aa_idx, :] = score_d
-                    tokens[spectrum_idx, aa_idx] = torch.argmax(score_d)
+                    target_mask[spec_idx, aa_idx] = False
+                    scores[spec_idx, aa_idx, :] = score_d_dict[spec_idx_item][
+                        0, :
+                    ]
+                    tokens[spec_idx, aa_idx] = torch.argmax(
+                        score_d_dict[spec_idx_item]
+                    )
 
-                # Record the mixed peptide tokens corresponding to scores.
-                pep_mixed_tokens = tokens[spectrum_idx, : aa_idx + 1]
+                target_tokens[spec_idx, aa_idx] = torch.argmax(score_t[i])
 
-                # Update the predicted peptide sequence.
-                target_tokens[spectrum_idx, aa_idx] = torch.argmax(score_t)
+                # Check if decoy stopped
+                if not stop_d[spec_idx] and spec_idx_item in score_d_dict:
+                    if (
+                        torch.argmax(score_d_dict[spec_idx_item])
+                        == self.model_d.stop_token
+                    ):
+                        stop_d[spec_idx] = True
 
-                # Calculate (partially) predicted peptide sequence by target model.
-                pep_target_tokens = target_tokens[spectrum_idx, : aa_idx + 1]
-                # FIXME: Fix this when depthcharge reverse
-                #   detokenization bug is fixed.
-                # peptide = self.model_t.tokenizer.detokenize(
-                #     torch.unsqueeze(pred_tokens, 0)
-                # )[0]
-                peptide = "".join(
-                    self.model_t.tokenizer.detokenize(
-                        torch.unsqueeze(pep_target_tokens, 0),
-                        join=False,
-                    )[0]
+            # Check termination conditions
+            for spec_idx in active_indices:
+                pep_target_tokens = target_tokens[spec_idx, : aa_idx + 1]
+
+                should_terminate = (
+                    pep_target_tokens[-1] == self.model_t.stop_token
+                    or pep_target_tokens[-1] in self.nterm_idx
+                    or aa_idx == self.model_t.max_peptide_len
                 )
 
-                # Terminate the sequence algorithm, if target model predicts the stop token.
-                # Others need to be added later.
-                if pep_target_tokens[-1] == self.model_t.stop_token:
-                    # Omit the stop token from the peptide sequence (if predicted by target
-                    # model). Also remove the corresponding amino acid score from the mixed
-                    # results to keep the sequence length aligned with the amino acid scores.
-                    has_stop_token = (
-                        pep_target_tokens[-1] == self.model_t.stop_token
-                    )
-                    pep_mixed_tokens = (
-                        pep_mixed_tokens[:-1]
-                        if has_stop_token
-                        else pep_mixed_tokens
-                    )
+                if should_terminate:
+                    active[spec_idx] = False
+                    last_aa_idx[spec_idx] = aa_idx
 
-                    # Calculate the amino acid and peptide scores.
-                    end_aa_idx = aa_idx if has_stop_token else aa_idx + 1
-                    aa_scores = self.model_t.softmax(
-                        scores[spectrum_idx : spectrum_idx + 1, :end_aa_idx, :]
+            if not torch.any(active):
+                break
+
+            # Update decoy spectra for active spectra
+            active_indices = torch.where(active)[0]
+            if len(active_indices) > 0:
+                peptides = []
+                for spec_idx in active_indices:
+                    pep_target_tokens = target_tokens[spec_idx, : aa_idx + 1]
+                    peptide = "".join(
+                        self.tokenizer.detokenize(
+                            torch.unsqueeze(pep_target_tokens, 0),
+                            join=False,
+                        )[0]
                     )
-                    aa_scores = aa_scores[
-                        0, range(end_aa_idx), pep_mixed_tokens
-                    ]
-                    aa_scores = aa_scores.tolist()
-                    if self.model_t.tokenizer.reverse:
-                        aa_scores = aa_scores[::-1]
+                    peptides.append(peptide)
 
-                    # Don't penalize non-fitting precursor m/z.
-                    aa_scores, peptide_score = _aa_pep_score(aa_scores, True)
-
-                    psms.append(
-                        (
-                            peptide_score,
-                            aa_scores,
-                            target_mask[spectrum_idx][:end_aa_idx]
-                            .cpu()
-                            .detach()
-                            .numpy(),
-                            peptide,
-                        )
-                    )
-                    break
-
-                # Update the demi-decoy spectrum for the next prediction.
-                mzs_d, ints_d = _perturb_spectrum(
-                    mzs_t,
-                    ints_t,
-                    peptide,
-                    precursor[0, 2].item(),
-                    int(precursor[0, 1].item()),
+                # Batch perturb all active spectra
+                mzs_d_batch, ints_d_batch = _perturb_spectrum_batched(
+                    mzs[active],
+                    ints[active],
+                    peptides,
+                    precursors[active, 2],
+                    precursors[active, 1].int(),
                     self.perturbed_aa_masses,
                     fragment_tolerance_da=self.fragment_tolerance_da,
                 )
-                # Encode the updated demi-decoy spectrum using the decoy model.
-                memories_d, mem_masks_d = self.model_d.encoder(mzs_d, ints_d)
-                # Update the accumulative mass shift.
-                accumulated_mass_shift += self.shifted_aa_masses[
-                    pep_target_tokens[-1].item()
-                ]
 
-                # Check whether the decoy model predicts the stop token.
-                if torch.argmax(score_d) == self.model_d.stop_token:
-                    stop_d = True
+                mzs_d[active] = mzs_d_batch
+                ints_d[active] = ints_d_batch
+
+                # Re-encode updated decoy spectra
+                memories_d_new, mem_masks_d_new = self.model_d.encoder(
+                    mzs_d[active], ints_d[active]
+                )
+                memories_d[active] = memories_d_new
+                mem_masks_d[active] = mem_masks_d_new
+
+                # Update target predicted peptide and mass shifts for decoy
+                for spec_idx in active_indices:
+                    pep_target_tokens = target_tokens[spec_idx, : aa_idx + 1]
+
+        # Postprocess all spectra
+        psms = []
+        for spec_idx in range(batch_size):
+            aa_idx = last_aa_idx[spec_idx].item()
+
+            pep_target_tokens = target_tokens[spec_idx, : aa_idx + 1]
+            peptide = "".join(
+                self.tokenizer.detokenize(
+                    torch.unsqueeze(pep_target_tokens, 0),
+                    join=False,
+                )[0]
+            )
+
+            has_stop = pep_target_tokens[-1] == self.model_t.stop_token
+
+            peptide_score, aa_scores, aa_mask, peptide = (
+                self._postprocess_token_and_score(
+                    scores=scores,
+                    tokens=tokens,
+                    target_mask=target_mask,
+                    spectrum_idx=spec_idx,
+                    aa_idx=aa_idx,
+                    has_stop_token=has_stop,
+                    peptide=peptide,
+                )
+            )
+            psms.append((peptide_score, aa_scores, aa_mask, peptide))
 
         return psms
+
+    def _postprocess_token_and_score(
+        self,
+        scores: torch.Tensor,
+        tokens: torch.Tensor,
+        target_mask: torch.Tensor,
+        spectrum_idx: int,
+        aa_idx: int,
+        has_stop_token: bool,
+        peptide: str,
+    ) -> Tuple[float, List[float], np.ndarray, str]:
+        """
+        Postprocess tokens and scores to create a PSM.
+
+        Parameters
+        ----------
+        scores : torch.Tensor
+            Scores tensor for all spectra.
+        tokens : torch.Tensor
+            Mixed tokens (from target or decoy) for all spectra.
+        target_mask : torch.Tensor
+            Mask indicating whether each token came from target model.
+        spectrum_idx : int
+            Index of the current spectrum.
+        aa_idx : int
+            Current amino acid index in the sequence.
+        has_stop_token : bool
+            Whether the sequence ended with a stop token.
+        peptide : str
+            The predicted peptide sequence.
+
+        Returns
+        -------
+        peptide_score : float
+            The overall peptide score.
+        aa_scores : List[float]
+            Amino acid-level scores.
+        aa_mask : np.ndarray
+            Target/decoy mask for each amino acid.
+        peptide : str
+            The predicted peptide sequence.
+        """
+        # Get the mixed tokens for this spectrum.
+        pep_mixed_tokens = tokens[spectrum_idx, : aa_idx + 1]
+
+        # Remove stop token from mixed tokens if present.
+        if has_stop_token:
+            pep_mixed_tokens = pep_mixed_tokens[:-1]
+
+        # Calculate the end index for scoring.
+        end_aa_idx = aa_idx if has_stop_token else aa_idx + 1
+
+        # Calculate amino acid scores using softmax.
+        aa_scores = self.model_t.softmax(
+            scores[spectrum_idx : spectrum_idx + 1, :end_aa_idx, :]
+        )
+        aa_scores = aa_scores[0, range(end_aa_idx), pep_mixed_tokens]
+        aa_scores = aa_scores.tolist()
+
+        # Reverse if needed.
+        if self.tokenizer.reverse:
+            aa_scores = aa_scores[::-1]
+
+        # Get target mask for the amino acids.
+        aa_mask = target_mask[spectrum_idx][:end_aa_idx].cpu().detach().numpy()
+
+        # Calculate peptide score (don't penalize non-fitting precursor m/z).
+        aa_scores, peptide_score = _aa_pep_score(aa_scores, True)
+
+        return peptide_score, aa_scores, aa_mask, peptide
 
     def training_step(self, *args) -> None:
         raise NotImplementedError(
@@ -1723,11 +1826,9 @@ class Spec2PepTargetDecoy(pl.LightningModule):
                 spec_match.aa_scores = spec_match.aa_scores[1:]
 
             # Compute the precursor m/z for reporting
-            spec_match.calc_mz = (
-                self.model_t.tokenizer.calculate_precursor_ions(
-                    spec_match.sequence, torch.tensor(spec_match.charge)
-                ).item()
-            )
+            spec_match.calc_mz = self.tokenizer.calculate_precursor_ions(
+                spec_match.sequence, torch.tensor(spec_match.charge)
+            ).item()
 
             self.out_writer.psms.append(spec_match)
 
@@ -2224,6 +2325,62 @@ def _aa_pep_score(
     return aa_scores, peptide_score
 
 
+def _perturb_spectrum_batched(
+    mzs_batch: torch.Tensor,
+    ints_batch: torch.Tensor,
+    peptides: List[str],
+    precursor_mzs: torch.Tensor,
+    charges: torch.Tensor,
+    perturbed_aa_masses: Dict[str, float],
+    fragment_tolerance_da: float = 0.5,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Perturb multiple spectra in parallel.
+
+    Parameters
+    ----------
+    mzs_batch : torch.Tensor of shape (batch_size, max_peaks)
+        The m/z values for each spectrum.
+    ints_batch : torch.Tensor of shape (batch_size, max_peaks)
+        The intensity values for each spectrum.
+    peptides : List[str]
+        The predicted peptide sequences for each spectrum.
+    precursor_mzs : torch.Tensor of shape (batch_size,)
+        The precursor m/z values.
+    charges : torch.Tensor of shape (batch_size,)
+        The precursor charges.
+    perturbed_aa_masses : Dict[str, float]
+        The perturbed amino acid masses.
+    fragment_tolerance_da : float
+        The fragment tolerance in Da.
+
+    Returns
+    -------
+    mzs_out : torch.Tensor of shape (batch_size, max_peaks)
+        The perturbed m/z values.
+    ints_out : torch.Tensor of shape (batch_size, max_peaks)
+        The perturbed intensity values.
+    """
+    batch_size = mzs_batch.shape[0]
+    mzs_out = []
+    ints_out = []
+
+    for i in range(batch_size):
+        mz_d, int_d = _perturb_spectrum(
+            mzs_batch[i : i + 1],
+            ints_batch[i : i + 1],
+            peptides[i],
+            precursor_mzs[i].item(),
+            int(charges[i].item()),
+            perturbed_aa_masses,
+            fragment_tolerance_da,
+        )
+        mzs_out.append(mz_d)
+        ints_out.append(int_d)
+
+    return torch.cat(mzs_out, dim=0), torch.cat(ints_out, dim=0)
+
+
 def _perturb_spectrum(
     mzs: torch.Tensor,
     ints: torch.Tensor,
@@ -2275,9 +2432,10 @@ def _perturb_spectrum(
     # b-ions are annotated by calculating them from the precursor mass.
     pred_ion_type = "y"
     comp_ion_type = "b"
+    parsed_peptide = spf.parse(peptide)[0]
     spectrum = _annotate_fragment_pairs(
         spectrum,
-        spf.parse(peptide)[0],
+        parsed_peptide,
         fragment_tolerance_da,
         pred_ion_type=pred_ion_type,
         comp_ion_type=comp_ion_type,
@@ -2286,16 +2444,13 @@ def _perturb_spectrum(
         neutral_losses=True,
     )
 
-    # Calculate perturbed precursor mass.
-    perturbed_precursor_mass = (precursor_mz - 1.007276) * precursor_charge
-    for aa, ptb_mass in perturbed_aa_masses.items():
-        org_mass = sfa.AA_MASS[aa]
-        perturbed_precursor_mass += ptb_mass - org_mass
+    # Calculate original precursor mass.
+    precursor_mass = (precursor_mz - 1.007276) * precursor_charge
 
     # Generate theoretical ions using perturbed masses.
     perturbed_annotations = _generate_fragment_pairs(
-        fragment=spf.parse(peptide)[0],
-        precursor_mass=perturbed_precursor_mass,
+        fragment=parsed_peptide,
+        precursor_mass=precursor_mass,
         pred_ion_type=pred_ion_type,
         comp_ion_type=comp_ion_type,
         max_isotope=1,
@@ -2522,7 +2677,7 @@ def _generate_fragment_pairs(
     )
 
     # Calculate target m/z values from partial sequence.
-    frag_peaks = []  # List[Tuple[FragmentAnnotation, float]]
+    frag_peaks = []
 
     for frag_annotation, frag_mz in partial_fragments:
         frag_str = str(frag_annotation)

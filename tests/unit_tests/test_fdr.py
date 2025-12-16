@@ -126,6 +126,9 @@ def test_spec2peptargetdecoy_forward(mock_aa_pep, mock_perturb):
     model = Spec2PepTargetDecoy(model_t, model_d)
     model.perturbed_aa_masses = {"P": 1.0, "E": 2.0, "D": 3.0}
 
+    # Add a dummy parameter so .device works
+    model.register_parameter('_dummy', torch.nn.Parameter(torch.zeros(1)))
+
     # dummy batch (one spectrum)
     filename, scan = "file.mgf", "scan_1"
     batch = {
