@@ -32,6 +32,7 @@ from casanovo.config import Config
 from casanovo.data import db_utils, ms_io, psm
 from casanovo.denovo.dataloaders import DeNovoDataModule
 from casanovo.denovo.evaluate import aa_match, aa_match_batch, aa_match_metrics
+from casanovo.denovo.transformers import PeptideDecoder
 from casanovo.denovo.model import (
     DbSpec2Pep,
     Spec2Pep,
@@ -2834,3 +2835,62 @@ def test_db_spec2pep_forward_no_cache(tiny_config):
 
     # Assert that the non-cached path was taken
     db_model._forward_step.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "mask_layers,frames_interact", [(0, True), (1, True), (4, False)]
+)
+def test_mask_layers_controls_frame_interaction(mask_layers, frames_interact):
+    """`mask_layers` decides how deep the frames stay independent.
+
+    Masked layers leave the global token as the only visible key, so
+    nothing crosses positions there. The observable: if any layer is
+    open, lengthening the frame budget changes the positions that were
+    already there. At mask_layers == n_layers it cannot, which is the
+    pre-7d48f94 decoder.
+
+    mask_layers=1 is the case worth pinning. Layer 1 stays masked, so the
+    precursor still arrives at weight 1.0, and layers 2 onward read
+    neighbours.
+    """
+    torch.manual_seed(0)
+    dim, heads, layers, frames, batch, peaks = 64, 8, 4, 12, 3, 7
+    decoder = PeptideDecoder(
+        n_tokens=10,
+        d_model=dim,
+        n_head=heads,
+        n_layers=layers,
+        dim_feedforward=64,
+        dropout=0.0,
+        padding_int=0,
+        mask_layers=mask_layers,
+    ).eval()
+    assert decoder.mask_layers == mask_layers
+
+    memory = torch.randn(batch, peaks, dim)
+    memory_mask = torch.zeros(batch, peaks, dtype=torch.bool)
+    precursors = torch.tensor(
+        [[500.0, 2.0, 251.0], [800.0, 3.0, 268.0], [1200.0, 4.0, 301.0]]
+    )
+
+    def decode(n_frames):
+        with torch.no_grad():
+            return decoder(
+                torch.zeros((batch, n_frames), dtype=torch.long),
+                precursors,
+                memory=memory,
+                memory_key_padding_mask=memory_mask,
+            )
+
+    short = decode(frames)
+    long = decode(frames * 2)
+    shared = (short - long[:, : short.shape[1]]).abs().max()
+    if frames_interact:
+        assert shared > 1e-4, (
+            f"mask_layers={mask_layers} leaves open layers, so appending "
+            "frames must change the positions already decoded"
+        )
+    else:
+        assert shared < 1e-5, (
+            "every layer is masked, so no position can read another"
+        )

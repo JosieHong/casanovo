@@ -157,6 +157,7 @@ class Spec2Pep(pl.LightningModule):
         # those auxiliary predictions carry. Empty list disables it, and the
         # model is then identical to the plain CTC decoder.
         self.self_cond_layers = tuple(kwargs.pop("self_cond_layers", ()) or ())
+        self.mask_layers = int(kwargs.pop("mask_layers", 0) or 0)
         self.self_cond_weight = float(kwargs.pop("self_cond_weight", 0.5))
         self.decoder = PeptideDecoder(
             n_tokens=self.tokenizer,
@@ -167,6 +168,7 @@ class Spec2Pep(pl.LightningModule):
             dropout=dropout,
             max_charge=max_charge,
             self_cond_layers=self.self_cond_layers,
+            mask_layers=self.mask_layers,
         )
         self.softmax = torch.nn.Softmax(2)
         self.ctc_loss = torch.nn.CTCLoss(

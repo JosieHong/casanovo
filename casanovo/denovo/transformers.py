@@ -56,6 +56,7 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         padding_int: int | None = None,
         max_charge: int = 4,
         self_cond_layers: Sequence[int] = (),
+        mask_layers: int = 0,
     ) -> None:
         """Initialize a PeptideDecoder."""
 
@@ -69,6 +70,21 @@ class PeptideDecoder(AnalyteTransformerDecoder):
             positional_encoder=positional_encoder,
             padding_int=padding_int,
         )
+
+        # How many leading layers keep the old key padding mask, which
+        # leaves the global token as the only visible key. Self-attention
+        # there returns the precursor at weight 1.0 to every frame and
+        # nothing crosses positions. 0 is full attention everywhere,
+        # n_layers reproduces the pre-7d48f94 decoder exactly.
+        #
+        # The point of a middle value: at layer 1 the frames carry only
+        # positional encoding, since self-attention runs before
+        # cross-attention, so opening it there dilutes the precursor from
+        # weight 1.0 to 1/(1 + n_frames) with nothing else worth reading.
+        # check_precursor_pathway.py measured frame_attn paying for that,
+        # 11.7x and 7.4x the uniform weight at layers 1 and 2 winning the
+        # precursor back, before settling to 0.1-0.7x from layer 3.
+        self.mask_layers = int(mask_layers)
 
         self.charge_encoder = torch.nn.Embedding(max_charge, d_model)
         self.mass_encoder = FloatEncoder(d_model)
@@ -96,6 +112,74 @@ class PeptideDecoder(AnalyteTransformerDecoder):
             )
         else:
             self.cond_proj = None
+
+    def _frame_mask(self, encoded):
+        """Hide every frame, sparing the global token at position 0.
+
+        The mask the superclass used to infer from the embedding values.
+        Written out here because it is now a deliberate setting rather
+        than a side effect of `padding_idx` being 0.
+        """
+        mask = torch.ones(
+            encoded.shape[:2], dtype=torch.bool, device=encoded.device
+        )
+        mask[:, 0] = False
+        return mask
+
+    def _run_layers(
+        self,
+        encoded,
+        memory,
+        memory_mask=None,
+        memory_key_padding_mask=None,
+        score=False,
+    ):
+        """Run the stack, masking the first ``mask_layers`` layers.
+
+        One loop for both decode paths. Keeping the mask schedule in a
+        single place is the whole reason this exists: the inferred mask
+        was wrong in two methods rather than one.
+
+        Parameters
+        ----------
+        score : bool
+            Collect the self-conditioning predictions and feed them back.
+
+        Returns
+        -------
+        Tuple[torch.Tensor, List[torch.Tensor]]
+            The final hidden states and the per-layer scores.
+        """
+        frame_mask = (
+            self._frame_mask(encoded) if self.mask_layers else None
+        )
+        # All-False: non-causal. Where the frames are masked it changes
+        # nothing, since the two masks are OR'd.
+        length = encoded.shape[1]
+        tgt_mask = torch.zeros(
+            (length, length), dtype=torch.bool, device=encoded.device
+        )
+
+        intermediates = []
+        for depth, layer in enumerate(self.transformer_decoder.layers, 1):
+            encoded = layer(
+                encoded,
+                memory,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=(
+                    frame_mask if depth <= self.mask_layers else None
+                ),
+                memory_mask=memory_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+            )
+            if score and depth in self.self_cond_layers:
+                scores = self.final(encoded)
+                intermediates.append(scores)
+                encoded = encoded + self.cond_proj(scores.softmax(dim=-1))
+
+        if self.transformer_decoder.norm is not None:
+            encoded = self.transformer_decoder.norm(encoded)
+        return encoded, intermediates
 
     def forward_self_conditioned(
         self,
@@ -142,31 +226,13 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         encoded = torch.cat([global_token[:, None, :], encoded], dim=1)
         encoded = self.positional_encoder(encoded)
 
-        # Non-causal attention, as in `embed` above: every frame sees
-        # every other frame. No key padding mask for the same reason
-        # given there.
-        length = encoded.shape[1]
-        tgt_mask = torch.zeros(
-            (length, length), dtype=torch.bool, device=encoded.device
+        encoded, intermediates = self._run_layers(
+            encoded,
+            memory,
+            memory_mask=memory_mask,
+            memory_key_padding_mask=memory_key_padding_mask,
+            score=True,
         )
-
-        intermediates = []
-        for depth, layer in enumerate(self.transformer_decoder.layers, 1):
-            encoded = layer(
-                encoded,
-                memory,
-                tgt_mask=tgt_mask,
-                tgt_key_padding_mask=None,
-                memory_mask=memory_mask,
-                memory_key_padding_mask=memory_key_padding_mask,
-            )
-            if depth in self.self_cond_layers:
-                scores = self.final(encoded)
-                intermediates.append(scores)
-                encoded = encoded + self.cond_proj(scores.softmax(dim=-1))
-
-        if self.transformer_decoder.norm is not None:
-            encoded = self.transformer_decoder.norm(encoded)
         return self.final(encoded), intermediates
 
     def global_token_hook(
@@ -258,20 +324,12 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         encoded = torch.cat([global_token[:, None, :], encoded], dim=1)
         encoded = self.positional_encoder(encoded)
 
-        if tgt_mask is None:
-            length = encoded.shape[1]
-            tgt_mask = torch.zeros(
-                (length, length), dtype=torch.bool, device=encoded.device
-            )
-
-        return self.transformer_decoder(
-            tgt=encoded,
-            memory=memory,
-            tgt_mask=tgt_mask,
-            tgt_key_padding_mask=None,
-            memory_key_padding_mask=memory_key_padding_mask,
+        return self._run_layers(
+            encoded,
+            memory,
             memory_mask=memory_mask,
-        )
+            memory_key_padding_mask=memory_key_padding_mask,
+        )[0]
 
 
 class SpectrumEncoder(SpectrumTransformerEncoder):

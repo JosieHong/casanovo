@@ -121,6 +121,19 @@ min_intensity: 0.01
 remove_precursor_tol: 2.0  # Da
 # Max precursor charge allowed, spectra with larger charge are skipped.
 max_charge: 4
+# How many leading decoder layers keep the key padding mask that leaves the
+# global token as the only visible key. Self-attention in those layers hands
+# every frame the precursor at weight 1.0 and nothing crosses positions.
+# 0 gives full attention everywhere; setting it to n_layers reproduces the
+# decoder as it behaved before 7d48f94, when the mask was inferred rather
+# than chosen.
+# A middle value exists because the two ends are not the same trade at every
+# depth. At layer 1 the frames carry only positional encoding, since
+# self-attention runs before cross-attention, so opening it there dilutes the
+# precursor to 1/(1 + max_peptide_len) with nothing else worth reading. From
+# layer 2 on the frames carry spectrum context and have something to read.
+mask_layers: 0
+
 
 # MODEL ARCHITECTURE OPTIONS
 # Dimensionality of latent representations, i.e. peak embeddings.

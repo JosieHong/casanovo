@@ -31,6 +31,7 @@ _config_deprecated = dict(
 # user config to list every key).
 _config_optional = frozenset(
     {
+        "mask_layers",
         "muon_lr",
         "muon_momentum",
         "resume_training",
@@ -104,6 +105,7 @@ class Config:
         weight_decay=float,
         muon_lr=float,
         muon_momentum=float,
+        mask_layers=int,
         self_cond_layers=list,
         self_cond_weight=float,
         train_label_smoothing=float,
